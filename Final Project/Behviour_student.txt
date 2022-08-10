@@ -1,0 +1,655 @@
+import numpy as np
+import py_trees as pt, py_trees_ros as ptr, rospy
+from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
+from actionlib import SimpleActionClient
+from play_motion_msgs.msg import PlayMotionAction, PlayMotionGoal
+from robotics_project.srv import MoveHead, MoveHeadRequest, MoveHeadResponse
+from std_srvs.srv import Empty, SetBool, SetBoolRequest
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal, MoveBaseActionResult
+
+placed = True  # initialize global variable "placed"
+# If false, relevant behaviours will be "reset"
+
+class counter(pt.behaviour.Behaviour):
+
+    # modified from Christopher Iliffe Sprague
+    # sprague@kth.se
+
+    """
+    Returns running for n ticks and success thereafter.
+    """
+
+    def __init__(self, n, name):
+
+        rospy.loginfo("Initialising counter behaviour.")
+
+        # counter
+        self.i = 0
+        self.n = n
+        self.redo = False
+
+        # become a behaviour
+        super(counter, self).__init__(name)
+
+    def update(self):
+        global placed
+
+        if not placed:
+            if not self.redo:
+                self.redo = True
+                self.i = 0
+                placed = True
+        else:
+            self.redo = False
+
+        # increment i
+        self.i += 1
+
+        # succeed after count is done
+        if self.i <= self.n:
+            return pt.common.Status.FAILURE
+        else:
+            placed = False # global variable placed set as False
+            rospy.loginfo("Failed to detect cube, attempt to pick up cube at goal again...")
+            return pt.common.Status.SUCCESS
+
+class go(pt.behaviour.Behaviour):
+
+    # modified from Christopher Iliffe Sprague
+    # sprague@kth.se
+
+    """
+    Returns running and commands a velocity indefinitely.
+    """
+
+    def __init__(self, name, linear, angular):
+
+        rospy.loginfo("Initialising go behaviour.")
+
+        # action space
+        self.cmd_vel_top = "/key_vel"
+        self.cmd_vel_pub = rospy.Publisher(self.cmd_vel_top, Twist, queue_size=10)
+
+        # command
+        self.move_msg = Twist()
+        self.move_msg.linear.x = linear
+        self.move_msg.angular.z = angular
+
+        # become a behaviour
+        super(go, self).__init__(name)
+
+    def update(self):
+
+        # send the message
+        rate = rospy.Rate(10)
+        self.cmd_vel_pub.publish(self.move_msg)
+        rate.sleep()
+
+        # tell the tree that you're running
+        return pt.common.Status.RUNNING
+
+class tuckarm(pt.behaviour.Behaviour):
+
+    # modified from Christopher Iliffe Sprague
+    # sprague@kth.se
+
+    """
+    Sends a goal to the tuck arm action server.
+    Returns running whilst awaiting the result,
+    success if the action was succesful, and v.v..
+    """
+
+    def __init__(self):
+
+        rospy.loginfo("Initialising tuck arm behaviour.")
+
+        # Set up action client
+        self.play_motion_ac = SimpleActionClient("/play_motion", PlayMotionAction)
+
+        # personal goal setting
+        self.goal = PlayMotionGoal()
+        self.goal.motion_name = 'home'
+        self.goal.skip_planning = True
+
+        # execution checker
+        self.sent_goal = False
+        self.done = False
+        self.redo = False
+
+        # become a behaviour
+        super(tuckarm, self).__init__("Tuck arm!")
+
+    def update(self):
+        global placed
+
+        if not placed: # ensures that "self.done" is reset when placed is False
+            if not self.redo:
+                self.done = False
+                self.redo = True
+                
+                self.sent_goal = False
+        else:
+            self.redo = False
+        
+        # already tucked the arm
+        if self.done:
+            return pt.common.Status.SUCCESS
+        
+        # command to tuck arm if haven't already
+        elif not self.sent_goal:
+
+            # send the goal
+            self.play_motion_ac.send_goal(self.goal)
+            self.sent_goal = True
+
+            # tell the tree you're running
+            return pt.common.Status.RUNNING
+
+        # if I was succesful! :)))))))))
+        elif self.play_motion_ac.get_result():
+
+            # than I'm finished!
+            self.done = True
+            return pt.common.Status.SUCCESS
+
+        # if failed
+        elif not self.play_motion_ac.get_result():
+            return pt.common.Status.FAILURE
+
+        # if I'm still trying :|
+        else:
+            return pt.common.Status.RUNNING
+
+class movehead(pt.behaviour.Behaviour):
+
+    # modified from Christopher Iliffe Sprague
+    # sprague@kth.se
+
+    """
+    Lowers or raisesthe head of the robot.
+    Returns running whilst awaiting the result,
+    success if the action was succesful, and v.v..
+    """
+
+    def __init__(self, direction):
+
+        rospy.loginfo("Initialising move head behaviour.")
+
+        # server
+        mv_head_srv_nm = rospy.get_param(rospy.get_name() + '/move_head_srv')
+        self.move_head_srv = rospy.ServiceProxy(mv_head_srv_nm, MoveHead)
+        rospy.wait_for_service(mv_head_srv_nm, timeout=30)
+
+        # head movement direction; "down" or "up"
+        self.direction = direction
+
+        # execution checker
+        self.tried = False
+        self.done = False
+        self.redo = False
+
+        # become a behaviour
+        super(movehead, self).__init__("Lower head!")
+
+    def update(self):
+        global placed
+
+        if not placed:
+            if not self.redo:
+                self.done = False
+                self.redo = True
+                self.tried = False
+        else:
+            self.redo = False
+
+        # success if done
+        if self.done:
+            return pt.common.Status.SUCCESS
+
+        # try if not tried
+        elif not self.tried:
+
+            # command
+            self.move_head_req = self.move_head_srv(self.direction)
+            self.tried = True
+
+            # tell the tree you're running
+            return pt.common.Status.RUNNING
+
+        # if succesful
+        elif self.move_head_req.success:
+            self.done = True
+            return pt.common.Status.SUCCESS
+
+        # if failed
+        elif not self.move_head_req.success:
+            return pt.common.Status.FAILURE
+
+        # if still trying
+        else:
+            return pt.common.Status.RUNNING
+
+class pickup(pt.behaviour.Behaviour):
+
+    """
+    Sends a request to the pick server.
+    Returns running whilst awaiting the result,
+    success if the action was succesful, and v.v..
+    """
+
+    def __init__(self):
+
+        rospy.loginfo("Initialising pickup behaviour.")
+
+        # Access rosparams
+        pick_srv_nm = rospy.get_param(rospy.get_name() + '/pick_srv')
+
+        # Initialize servers
+        self.pick_srv = rospy.ServiceProxy(pick_srv_nm, SetBool)
+
+        rospy.wait_for_service(pick_srv_nm, timeout=30)
+
+        # execution checker
+        self.tried = False
+        self.done = False
+        self.redo = False
+
+        # become a behaviour
+        super(pickup, self).__init__("Pick up Cube!")
+
+    def update(self):
+        global placed
+
+        if not placed:
+            if not self.redo:
+                self.done = False
+                self.redo = True
+                self.tried = False
+        else:
+            self.redo = False
+
+        # success if done
+        if self.done:
+            return pt.common.Status.SUCCESS
+
+        # try if not tried
+        elif not self.tried:
+
+            # command
+
+            self.pick_up_req = self.pick_srv(True)
+            self.tried = True
+
+            # tell the tree you're running
+            return pt.common.Status.RUNNING
+
+        # if succesful
+        elif self.pick_up_req.success:
+            self.done = True
+            return pt.common.Status.SUCCESS
+
+        # if failed
+        elif not self.pick_up_req.success:
+            return pt.common.Status.FAILURE
+
+        # if still trying
+        else:
+            return pt.common.Status.RUNNING
+
+
+class place(pt.behaviour.Behaviour):
+
+    """
+    Sends a request to the place server.
+    Returns running whilst awaiting the result,
+    success if the action was succesful, and v.v..
+    """
+
+    def __init__(self):
+
+        rospy.loginfo("Initialising place behaviour.")
+
+        # Access rosparams
+        place_srv_nm = rospy.get_param(rospy.get_name() + '/place_srv')
+
+        # Initialize servers
+        self.place_srv = rospy.ServiceProxy(place_srv_nm, SetBool)
+
+        rospy.wait_for_service(place_srv_nm, timeout=30)
+
+        # execution checker
+        self.tried = False
+        self.done = False
+        self.redo = False
+
+        # become a behaviour
+        super(place, self).__init__("Place the Cube!")
+
+    def update(self):
+        global placed
+
+        if not placed:
+            if not self.redo:
+                self.done = False
+                self.redo = True
+                self.tried = False
+        else:
+            self.redo = False
+
+        # success if done
+        if self.done:
+            return pt.common.Status.SUCCESS
+
+        # try if not tried
+        elif not self.tried:
+
+            # command
+
+            self.place_req = self.place_srv(True)
+            self.tried = True
+
+            # tell the tree you're running
+            return pt.common.Status.RUNNING
+
+        # if succesful
+        elif self.place_req.success:
+            self.done = True
+            return pt.common.Status.SUCCESS
+
+        # if failed
+        elif not self.place_req.success:
+            placed = False
+            return pt.common.Status.FAILURE
+
+        # if still trying
+        else:
+            return pt.common.Status.RUNNING
+
+class detect_run(pt.behaviour.Behaviour):
+
+    """
+    Detect the cube using the camera.
+    Returns running whilst awaiting the result,
+    Success if the action was succesful, and v.v..
+    """
+
+    def __init__(self):
+
+        rospy.loginfo("Initialising Detect_run behaviour.")
+        # Access rosparams
+        self.aruco_pose_cam_top = rospy.get_param('/robotics_intro/aruco_single/marker_pose_topic')  # cube pose topic from robot camera
+        self.aruco_pose_top = rospy.get_param('/robotics_intro/manipulation_client/marker_pose_topic')  # cube pose topic used by pick_srv
+
+        # initialize publishers
+        self.aruco_pub = rospy.Publisher(self.aruco_pose_top, PoseStamped, queue_size=10)
+
+        # execution checkers
+        self.aruco_pose_rcv = False
+        self.done = False
+        self.redo = False
+
+		# become a behaviour
+        super(detect_run, self).__init__("Detect cube!")
+
+    def aruco_pose_cb(self, aruco_pose_msg):
+        self.aruco_pose = aruco_pose_msg
+        self.aruco_pose_rcv = True
+
+    def update(self):
+        global placed
+
+        if not placed:
+            if not self.redo:
+                self.done = False
+                self.redo = True
+                self.aruco_pose_rcv = False
+        else:
+            self.redo = False
+
+        if self.done == True:
+            return pt.common.Status.SUCCESS
+
+        self.cube_pose_sub = rospy.Subscriber(self.aruco_pose_cam_top, PoseStamped, self.aruco_pose_cb)
+        if self.aruco_pose_rcv == False:
+            return pt.common.Status.RUNNING
+
+        self.aruco_pub.publish(self.aruco_pose)
+        rospy.loginfo("Detect success.")
+        self.done = True
+        return pt.common.Status.SUCCESS
+
+class detect_fail(pt.behaviour.Behaviour):
+
+    """
+    Detect the cube using the camera.
+    Returns failer if success is not achieved
+    within the specified time
+    Returns running whilst awaiting the result,
+    Success if the action was succesful, and v.v..
+    """
+
+    def __init__(self, n):
+
+        rospy.loginfo("Initialising Detect_fail behaviour.")
+        # Access rosparams
+        self.aruco_pose_cam_top = rospy.get_param('/robotics_intro/aruco_single/marker_pose_topic')  # cube pose topic from robot camera
+        self.aruco_pose_top = rospy.get_param('/robotics_intro/manipulation_client/marker_pose_topic')  # cube pose topic used by pick_srv
+
+        # initialize publishers
+        self.aruco_pub = rospy.Publisher(self.aruco_pose_top, PoseStamped, queue_size=10)
+
+        # counters
+        self.i = 0
+        self.n = n
+
+        # execution checkers
+        self.aruco_pose_rcv = False
+        self.done = False
+        self.redo = False
+		# become a behaviour
+        super(detect_fail, self).__init__("Detect cube!")
+
+    def aruco_pose_cb(self, aruco_pose_msg):
+        self.aruco_pose = aruco_pose_msg
+        self.aruco_pose_rcv = True
+
+    def update(self):
+        global placed
+
+        if not placed:
+            if not self.redo:
+                self.done = False
+                self.redo = True
+                self.aruco_pose_rcv = False
+                self.i = 0
+        else:
+            self.redo = False
+
+        # increment i
+        self.i += 1
+
+        if self.done == True:
+            return pt.common.Status.SUCCESS
+
+        self.cube_pose_sub = rospy.Subscriber(self.aruco_pose_cam_top, PoseStamped, self.aruco_pose_cb)
+        if self.aruco_pose_rcv == False:
+            if self.i <= self.n:
+                return pt.common.Status.RUNNING
+            else:
+                return pt.common.Status.FAILURE
+        else:
+            self.aruco_pub.publish(self.aruco_pose)
+            rospy.loginfo("Detect_fail SUCCESS.")
+            self.done = True
+            placed = True
+            return pt.common.Status.SUCCESS
+            
+
+class localize(pt.behaviour.Behaviour):
+    def __init__(self):
+
+        rospy.loginfo("Initialising Localize behaviour.")
+        # Access rosparams
+        self.lclz_srv_nm = rospy.get_param(rospy.get_name() + '/global_loc_srv')
+        self.cost_map_srv_nm = rospy.get_param(rospy.get_name() + '/clear_costmaps_srv')
+        self.cmd_vel_top = "/key_vel"
+
+        rospy.wait_for_service(self.lclz_srv_nm, timeout=30)
+        rospy.wait_for_service(self.cost_map_srv_nm, timeout=30)
+
+        self.lclz_srv = rospy.ServiceProxy(self.lclz_srv_nm, Empty) # localization service
+        self.cost_map_srv = rospy.ServiceProxy(self.cost_map_srv_nm, Empty)
+
+        self.cmd_vel_pub = rospy.Publisher(self.cmd_vel_top, Twist, queue_size=10)
+
+        self.move_msg = Twist()
+        
+        self.covariance_rcv = False
+        self.lclz_tried = False
+
+		# become a behaviour
+        super(localize, self).__init__("Localize Tiago!")
+
+    def covariance_cb(self, covariance_msg):
+        self.covariance = covariance_msg.pose.covariance
+        self.covariance_rcv = True
+
+    def update(self):
+        self.covariance_sub = rospy.Subscriber("/amcl_pose", PoseWithCovarianceStamped, self.covariance_cb)
+
+        if self.lclz_tried == False:
+            lclz_req = self.lclz_srv()
+            #cost_map_req = self.cost_map_srv()
+            self.lclz_tried = True
+
+        if self.covariance_rcv == True:
+            i = np.abs(self.covariance)
+            rospy.loginfo("relocalizing...")
+            while np.amax(i) > 0.035:
+                self.move_msg.angular.z = -1
+                self.cmd_vel_pub.publish(self.move_msg)
+                self.covariance_sub = rospy.Subscriber("/amcl_pose", PoseWithCovarianceStamped, self.covariance_cb)
+                i = np.abs(self.covariance) 
+                
+            self.lclz_tried = False
+            rospy.loginfo('localize COMPLETE')
+            return pt.common.Status.FAILURE
+        else:
+            rospy.loginfo('localize RUNNING')
+            return pt.common.Status.RUNNING
+
+        rospy.loginfo('localize miss')
+
+class navigate(pt.behaviour.Behaviour):
+
+    """
+    Navigate Tiago to a goal using the
+    move_base action client.
+    Returns failure if covariance not converged,
+    running while navigating to goal
+    and success when goal is reached
+    """
+
+    def __init__(self, pose_name):
+
+        rospy.loginfo("Initialising Navigate behaviour.")
+        # Access rosparams
+        self.target_pose_top = rospy.get_param(pose_name)
+
+        # Set up action client
+        self.move_base_ac = SimpleActionClient('/move_base', MoveBaseAction)
+        if not self.move_base_ac.wait_for_server(rospy.Duration(1000)):
+            rospy.logerr("%s: Could not connect to /move_base action server")
+            exit()
+        rospy.loginfo("%s: Connected to play_motion action server")
+
+        # counters
+        self.i = 0
+
+        # execution checkers
+        self.done = False
+        self.sent = False
+        self.redo = False
+        self.nav_res_rcv = False
+        self.covariance_rcv = False
+        self.target_pose_rcv = False
+        if pose_name == '/robotics_intro/poses_publisher/pick_pose_topic':
+            self.const = 2
+        else:
+            self.const = 1
+        
+        super(navigate, self).__init__("Navigate Tiago!")
+
+    def covariance_cb(self, covariance_msg):
+        self.covariance = covariance_msg.pose.covariance
+        self.covariance_rcv = True
+
+    def target_pose_cb(self, target_pose_msg):
+        self.target_pose = target_pose_msg
+        self.target_pose_rcv = True
+
+    def nav_res_cb(self, nav_res_msg):
+        self.nav_res = nav_res_msg
+        self.nav_res_rcv = True
+
+    def update(self):
+        global placed
+
+        if not placed:
+            if not self.redo:
+                self.done = False
+                self.redo = True
+
+                self.sent = False
+                self.nav_res_rcv = False
+                self.target_pose_rcv = False
+                self.nav_res = None
+        else:
+            self.redo = False
+    
+        if self.done:
+            return pt.common.Status.SUCCESS
+
+        self.covariance_sub = rospy.Subscriber("/amcl_pose", PoseWithCovarianceStamped, self.covariance_cb)
+        if self.covariance_rcv == True:
+            i = np.abs(self.covariance)
+            if np.amax(i) > 0.04/self.const:
+                rospy.loginfo("Not converged, relocalize...")
+                self.const = 1
+                return pt.common.Status.FAILURE # failure will call localize() action to decrease covariance
+
+        if self.sent == False:
+
+            while not self.target_pose_rcv: # recieve target pose
+                self.target_pose_sub = rospy.Subscriber(self.target_pose_top, PoseStamped, self.target_pose_cb)
+
+            goal = MoveBaseGoal()
+            goal.target_pose = self.target_pose
+            self.move_base_ac.send_goal(goal) # send target pose to ac
+            rospy.loginfo("Navigate to goal...")
+            self.sent = True
+        else:
+            self.nav_res_sub = rospy.Subscriber("/move_base/result", MoveBaseActionResult, self.nav_res_cb)
+            rospy.sleep(0.1)
+            if self.nav_res_rcv == True:
+                if self.nav_res.status.status == 3: # if goal reached
+                    self.done = True
+                    rospy.loginfo("Arrived at navigation goal")
+                    return pt.common.Status.SUCCESS
+                elif self.nav_res.status.status == 4: # if "Failed to send global plan"...
+                    rospy.loginfo("Failed to pass plan, re-sending goal...")
+                    self.target_pose_rcv = False
+                    self.nav_res_rcv = False
+                    self.sent = False
+                    self.i += 1
+
+                    if self.i >= 4:
+                        rospy.loginfo("Force relocalize") 
+                        self.const = 100 # force self relocalize to get rid of "ghost walls"
+                        self.i = 0
+                    else:
+                        rospy.loginfo("Tries left before force relocalize:" + str(4-self.i))
+
+                    
+
+        return pt.common.Status.RUNNING
